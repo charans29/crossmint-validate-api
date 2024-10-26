@@ -1,6 +1,7 @@
 import express from 'express';
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 import cors from 'cors';
+import { mapObjects } from './mapService';
 
 const app = express();
 const PORT = 3000;
@@ -8,132 +9,88 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-const GOAL_URL = 'https://challenge.crossmint.com/api/map/680d9354-922c-4978-84fe-f9dd2d45bec7/goal';
-const CANDIDATE_ID = "680d9354-922c-4978-84fe-f9dd2d45bec7";
-const BASE_URL = "https://challenge.crossmint.io/api/polyanets";
-const REQUEST_DELAY = 200;
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-interface ErrorResponse {
-    message: string;
+interface MapPayload {
+  candidateId: string;
+  row: number;
+  column: number;
+  color?: string;  
+  direction?: string;
 }
 
-// Function to fetch the goal grid from the API
-async function fetchGoalGrid() {
+const sendRequestWithRetry = async (
+  method: 'POST' | 'DELETE',
+  endpoint: string,
+  payload: MapPayload
+) => {
+  while (true) {
     try {
-        const response = await axios.get(GOAL_URL);
-        return response.data.goal; 
+      if (method === 'POST') {
+        await axios.post(endpoint, payload);
+      } else if (method === 'DELETE') {
+        await axios.delete(endpoint, { data: payload });
+      }
+      return;
     } catch (error) {
-        handleError(error, 'fetching the goal grid');
+      if (axios.isAxiosError(error) && error.response?.status === 429) {
+        const retryAfter = error.response.headers['retry-after'];
+        const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000;
+        console.warn(`Rate limit hit. Retrying after ${waitTime / 1000} seconds...`);
+        await delay(waitTime);
+      } else {
+        throw error;
+      }
     }
-}
+  }
+};
 
-// Generic error handler
-function handleError(error: unknown, context: string) {
-    const axiosError = error as AxiosError;
-    const errorMessage =
-        (axiosError.response?.data as ErrorResponse)?.message ||
-        axiosError.message ||
-        'Unknown error occurred';
-    console.error(`Error ${context}:`, errorMessage);
-    throw new Error(errorMessage);
-}
+const modifyMapWithGoal = async (
+  candidateId: string,
+  objectType: string,
+  action: 'create' | 'delete'
+) => {
+  const filteredObjects = mapObjects.filter((obj) => {
+    if (objectType === 'polyanets' && obj.type === 'POLYANET') return true;
+    if (objectType === 'soloons' && obj.type === 'SOLOON') return true;
+    if (objectType === 'comeths' && obj.type === 'COMETH') return true;
+    return false;
+  });
 
-// Function to send requests with retries and exponential backoff
-async function sendRequest(method: 'post' | 'delete', url: string, data: object, delay: number): Promise<void> {
-    let attempts = 0;
-    while (attempts < 5) {
-        try {
-            await new Promise(r => setTimeout(r, delay));
-            const response = await axios({
-                method,
-                url,
-                data,
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-            });
-            console.log(`Successfully ${method === 'post' ? 'posted' : 'deleted'} POLYANET:`, response.data);
-            return; // Exit on success
-        } catch (error) {
-            const axiosError = error as AxiosError;
-            if (axiosError.response?.status === 429) {
-                attempts++;
-                const waitTime = Math.pow(2, attempts) * 100; // Exponential backoff
-                console.warn(`Rate limit hit, retrying ${attempts}/5 after ${waitTime}ms...`);
-                await new Promise(r => setTimeout(r, waitTime)); // Wait before retrying
-            } else {
-                handleError(error, `while ${method === 'post' ? 'posting' : 'deleting'} POLYANET`);
-            }
-        }
-    }
-}
+  for (const obj of filteredObjects) {
+    const endpoint = `https://challenge.crossmint.com/api/${objectType}`;
+    const payload: MapPayload = {
+      candidateId,
+      row: obj.coordinates.row,
+      column: obj.coordinates.column,
+      ...(action === 'create' && obj.type === 'SOLOON' && { color: obj.color }),
+      ...(action === 'create' && obj.type === 'COMETH' && { direction: obj.direction }),
+    };
 
-async function modifyMapWithGoal() {
     try {
-        const goalGrid = await fetchGoalGrid();
-        let delay = 0;
-        const deletePromises: Promise<void>[] = [];
-
-        for (let i = 0; i < goalGrid.length; i++) {
-            for (let j = 0; j < goalGrid[i].length; j++) {
-                if (goalGrid[i][j] === "POLYANET") {
-                    deletePromises.push(sendRequest('post', BASE_URL, {
-                        candidateId: CANDIDATE_ID,
-                        row: i,
-                        column: j
-                    }, delay));
-                    delay += REQUEST_DELAY; // Increase delay for the next request
-                }
-            }
-        }
-        await Promise.all(deletePromises);
+      await sendRequestWithRetry(action === 'create' ? 'POST' : 'DELETE', endpoint, payload);
+      console.log(`Successfully ${action === 'create' ? 'posted' : 'deleted'} ${obj.type} at (${obj.coordinates.row}, ${obj.coordinates.column})`);
     } catch (error) {
-        handleError(error, 'modifying the map');
+      const errorMessage = (error as Error).message;
+      throw new Error(`Failed to ${action === 'create' ? 'post' : 'delete'} ${obj.type} at (${obj.coordinates.row}, ${obj.coordinates.column}): ${errorMessage}`);
     }
-}
+  }
+};
 
-async function deletePolyanets() {
-    try {
-        const goalGrid = await fetchGoalGrid();
-        let delay = 0;
-        const deletePromises: Promise<void>[] = [];
-
-        for (let i = 0; i < goalGrid.length; i++) {
-            for (let j = 0; j < goalGrid[i].length; j++) {
-                if (goalGrid[i][j] === "POLYANET") {
-                    deletePromises.push(sendRequest('delete', BASE_URL, {
-                        candidateId: CANDIDATE_ID,
-                        row: i,
-                        column: j
-                    }, delay));
-                    delay += REQUEST_DELAY; // Increase delay for the next request
-                }
-            }
-        }
-        await Promise.all(deletePromises);
-    } catch (error) {
-        handleError(error, 'deleting polyanets');
-    }
-}
-
-app.post('/api/map/680d9354-922c-4978-84fe-f9dd2d45bec7/polyanets', async (_, res) => {
-    try {
-        await modifyMapWithGoal();
-        res.json({ message: "Map modification completed with rate limiting." });
-    } catch (error) {
-        res.status(500).json({ message: "Map modification NOT completed with rate limiting." });
-    }
+app.post('/api/map/:candidateId/:object', (req, res) => {
+  const { candidateId, object } = req.params;
+  modifyMapWithGoal(candidateId, object, 'create')
+    .then(() => res.status(201).send(`${object} created`))
+    .catch(err => res.status(400).send(err.message));
 });
 
-app.delete('/api/map/680d9354-922c-4978-84fe-f9dd2d45bec7/polyanets', async (_, res) => {
-    try {
-        await deletePolyanets();
-        res.json({ message: "Map deletion completed with rate limiting." });
-    } catch (error) {
-        res.status(500).json({ message: "Map deletion NOT completed with rate limiting." });
-    }
+app.delete('/api/map/:candidateId/:object', (req, res) => {
+  const { candidateId, object } = req.params;
+  modifyMapWithGoal(candidateId, object, 'delete')
+    .then(() => res.status(200).send(`${object} deleted`))
+    .catch(err => res.status(400).send(err.message));
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
